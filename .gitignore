@@ -1,0 +1,10 @@
+__pycache__
+.cache
+.venv
+.claude
+out/
+res/
+tmp/
+
+.env
+further_prompt.md
