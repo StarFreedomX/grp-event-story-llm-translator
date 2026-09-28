@@ -4,6 +4,7 @@
 """
 
 import logging
+import re
 from pathlib import Path
 
 import requests
@@ -105,38 +106,29 @@ def _dump_raw(raw: str, save_dir: str | None, label: str = ""):
     from datetime import datetime
     path = Path(save_dir)
     path.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now().strftime("%H%M%S")
+    ts = datetime.now().strftime("%H%M%S_%f")
     dump = path / f"_raw_response_{ts}.txt"
     dump.write_text(raw, encoding="utf-8")
     logger.warning("原始响应已保存至: %s %s", dump, label)
 
 
 def _parse_output_text(raw: str, count: int, save_dir: str | None = None) -> list[str]:
-    """解析 AI 返回的纯文本，按空行分隔每句翻译。
+    """按 [序号] 解析译文；缺号或重号时拒绝写入错位结果。"""
+    matches = list(re.finditer(r"(?m)^\s*\[(\d+)\][ \t]*(.*)$", raw))
+    numbers = [int(m.group(1)) for m in matches]
+    if numbers != list(range(1, count + 1)) or (matches and raw[:matches[0].start()].strip()):
+        logger.warning("翻译编号不匹配: 期望 1-%d, 实际 %s", count, numbers)
+        _dump_raw(raw, save_dir, "(编号不匹配)")
+        raise ValueError(f"翻译编号不匹配: 期望 1-{count}")
 
-    行数不匹配时自动保存原始响应。
-    """
-    blocks = [b.strip() for b in raw.strip().split("\n\n")]
-    blocks = [b for b in blocks if b]
-
-    if len(blocks) != count:
-        logger.warning("翻译行数不匹配: 期望 %d 句, 实际 %d 句", count, len(blocks))
-        _dump_raw(raw, save_dir, "(行数不匹配)")
-
-    while len(blocks) < count:
-        blocks.append("")
-    return blocks[:count]
-
-    results = []
-    for item in items:
-        if isinstance(item, dict):
-            results.append({
-                "speaker": item.get("s", ""),
-                "text": item.get("t", ""),
-            })
-    while len(results) < count:
-        results.append({"speaker": "", "text": ""})
-    return results[:count]
+    translations = []
+    for i, match in enumerate(matches):
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(raw)
+        translations.append(raw[match.start(2):end].strip())
+    if any(not item for item in translations):
+        _dump_raw(raw, save_dir, "(空译文)")
+        raise ValueError("存在空译文")
+    return translations
 
 
 def _call_openai(
@@ -148,7 +140,7 @@ def _call_openai(
     """调用 OpenAI 兼容 API，发送/接收 JSON。"""
     import json as _json
     input_json = _build_input_json(lines)
-    user_msg = f"{input_json}\n\n请逐行翻译以上 JSON 中每个元素的 t 字段为中文，每行翻译之间用空行隔开，共 {len(lines)} 行。只输出翻译文本，不要 JSON。"
+    user_msg = f"{input_json}\n\n请按顺序翻译以上 JSON 中每个元素的 t 字段为中文，共 {len(lines)} 条。每条以 [1]、[2] 等连续编号开头，编号从 1 开始；每条译文只占一行，不要 JSON、说话人或其他内容。"
     messages = [
         {"role": "system", "content": prompt},
         {"role": "user", "content": user_msg},
@@ -185,7 +177,7 @@ def _call_anthropic(
 ) -> list[str]:
     """调用 Anthropic API，JSON 输入，纯文本输出。"""
     input_json = _build_input_json(lines)
-    user_msg = f"{input_json}\n\n请逐行翻译以上 JSON 中每个元素的 t 字段为中文，每行翻译之间用空行隔开，共 {len(lines)} 行。只输出翻译文本，不要 JSON。"
+    user_msg = f"{input_json}\n\n请按顺序翻译以上 JSON 中每个元素的 t 字段为中文，共 {len(lines)} 条。每条以 [1]、[2] 等连续编号开头，编号从 1 开始；每条译文只占一行，不要 JSON、说话人或其他内容。"
 
     body: dict = {
         "model": config.model,
@@ -224,7 +216,7 @@ def translate_all(
 ) -> list[str]:
     """翻译台词列表，返回翻译后的文本列表（与输入一一对应）。
 
-    整话一次性发送，纯文本输出避免 JSON 转义问题。
+    整话一次性发送，使用编号验证译文与输入逐条对应。
     """
     if config is None:
         from .config import load_mt_config
@@ -240,10 +232,17 @@ def translate_all(
     prompt = _load_prompt(config)
     try:
         if config.api_format == "anthropic":
-            return _call_anthropic(lines, config, prompt, save_dir)
+            call = _call_anthropic
         else:
-            return _call_openai(lines, config, prompt, save_dir)
+            call = _call_openai
+        for attempt in range(2):
+            try:
+                return call(lines, config, prompt, save_dir)
+            except ValueError:
+                if attempt == 0:
+                    logger.warning("译文格式不正确，重试一次")
+                    continue
+                raise
     except Exception as e:
         logger.error("翻译调用失败: %s", e)
-        _dump_raw(str(e), save_dir, "(API 调用异常)")
-        return [f"[翻译失败: {e}]"] * len(lines)
+        raise

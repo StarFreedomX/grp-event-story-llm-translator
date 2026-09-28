@@ -194,6 +194,7 @@ def main():
         logger.info("解析: %s (%d 句)", jf.name, len(lines))
 
     # 第二步：并行翻译
+    failed_count = 0
     if do_mt:
         from concurrent.futures import ThreadPoolExecutor
         total = len(tasks)
@@ -209,6 +210,7 @@ def main():
                     t["translations"] = fut.result()
                     logger.info("翻译 [%d/%d] 第 %d 话 完成", t["i"] + 1, len(json_files), t["i"])
                 except Exception as e:
+                    failed_count += 1
                     logger.error("翻译 [%d/%d] 第 %d 话 失败: %s", t["i"] + 1, len(json_files), t["i"], e)
                     t["translations"] = [f"[翻译失败: {e}]"] * len(t["lines"])
     else:
@@ -221,7 +223,10 @@ def main():
         out_path = out_dir / t["filename"]
         build_xlsx(t["lines"], t["translations"], out_path)
 
-    logger.info("完成，输出目录: %s", out_dir.resolve())
+    if failed_count:
+        logger.error("处理完成，但有 %d 话机翻失败，输出目录: %s", failed_count, out_dir.resolve())
+    else:
+        logger.info("完成，输出目录: %s", out_dir.resolve())
 
     # 清理中间文件(有原始响应留档时不删)
     keep_temp = _get("KEEP_TEMP", "false").lower() == "true"
@@ -235,6 +240,9 @@ def main():
             else:
                 shutil.rmtree(tmp_dir, ignore_errors=True)
                 logger.debug("已清理临时目录: %s", tmp_dir)
+
+    if failed_count:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
